@@ -19,6 +19,7 @@
 
 package org.apache.pulsar.functions.runtime;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -27,6 +28,7 @@ import com.google.protobuf.Empty;
 import com.squareup.okhttp.Response;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.kubernetes.client.ApiException;
 import io.kubernetes.client.apis.AppsV1Api;
 import io.kubernetes.client.apis.CoreV1Api;
 import io.kubernetes.client.custom.Quantity;
@@ -38,6 +40,7 @@ import io.kubernetes.client.models.V1EnvVarSource;
 import io.kubernetes.client.models.V1LabelSelector;
 import io.kubernetes.client.models.V1ObjectFieldSelector;
 import io.kubernetes.client.models.V1ObjectMeta;
+import io.kubernetes.client.models.V1PodList;
 import io.kubernetes.client.models.V1PodSpec;
 import io.kubernetes.client.models.V1PodTemplateSpec;
 import io.kubernetes.client.models.V1ResourceRequirements;
@@ -47,15 +50,6 @@ import io.kubernetes.client.models.V1ServiceSpec;
 import io.kubernetes.client.models.V1StatefulSet;
 import io.kubernetes.client.models.V1StatefulSetSpec;
 import io.kubernetes.client.models.V1Toleration;
-
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.pulsar.functions.instance.AuthenticationConfig;
@@ -66,14 +60,26 @@ import org.apache.pulsar.functions.proto.InstanceCommunication;
 import org.apache.pulsar.functions.proto.InstanceCommunication.FunctionStatus;
 import org.apache.pulsar.functions.proto.InstanceControlGrpc;
 import org.apache.pulsar.functions.secretsproviderconfigurator.SecretsProviderConfigurator;
+import org.apache.pulsar.functions.utils.Actions;
+import org.apache.pulsar.functions.utils.FunctionDetailsUtils;
 import org.apache.pulsar.functions.utils.Utils;
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static java.net.HttpURLConnection.HTTP_CONFLICT;
+import static java.net.HttpURLConnection.HTTP_NOT_FOUND;
 
 /**
  * Kubernetes based runtime for running functions.
@@ -85,7 +91,11 @@ import static java.net.HttpURLConnection.HTTP_CONFLICT;
  * The service abstraction is used for getting functionstatus.
  */
 @Slf4j
-class KubernetesRuntime implements Runtime {
+@VisibleForTesting
+public class KubernetesRuntime implements Runtime {
+
+    private static int NUM_RETRIES = 5;
+    private static long SLEEP_BETWEEN_RETRIES_MS = 500;
 
     private static final String ENV_SHARD_ID = "SHARD_ID";
     private static final int maxJobNameSize = 55;
@@ -123,7 +133,7 @@ class KubernetesRuntime implements Runtime {
     private final String originalCodeFileName;
     private final String pulsarAdminUrl;
     private final SecretsProviderConfigurator secretsProviderConfigurator;
-    private boolean running;
+    private int percentMemoryPadding;
 
 
     KubernetesRuntime(AppsV1Api appsClient,
@@ -147,7 +157,8 @@ class KubernetesRuntime implements Runtime {
                       String stateStorageServiceUrl,
                       AuthenticationConfig authConfig,
                       SecretsProviderConfigurator secretsProviderConfigurator,
-                      Integer expectedMetricsInterval) throws Exception {
+                      Integer expectedMetricsCollectionInterval,
+                      int percentMemoryPadding) throws Exception {
         this.appsClient = appsClient;
         this.coreClient = coreClient;
         this.instanceConfig = instanceConfig;
@@ -160,6 +171,7 @@ class KubernetesRuntime implements Runtime {
         this.originalCodeFileName = pulsarRootDir + "/" + originalCodeFileName;
         this.pulsarAdminUrl = pulsarAdminUrl;
         this.secretsProviderConfigurator = secretsProviderConfigurator;
+        this.percentMemoryPadding = percentMemoryPadding;
         String logConfigFile = null;
         String secretsProviderClassName = secretsProviderConfigurator.getSecretsProviderClassName(instanceConfig.getFunctionDetails());
         String secretsProviderConfig = null;
@@ -174,31 +186,38 @@ class KubernetesRuntime implements Runtime {
                 logConfigFile = pulsarRootDir + "/conf/functions-logging/console_logging_config.ini";
                 break;
         }
-        this.processArgs = RuntimeUtils.composeArgs(
-            instanceConfig,
-            instanceFile,
-            extraDependenciesDir,
-            logDirectory,
-            this.originalCodeFileName,
-            pulsarServiceUrl,
-            stateStorageServiceUrl,
-            authConfig,
-            "$" + ENV_SHARD_ID,
-            GRPC_PORT,
-            -1l,
-            logConfigFile,
-            secretsProviderClassName,
-            secretsProviderConfig,
-            installUserCodeDependencies,
-            pythonDependencyRepository,
-            pythonExtraDependencyRepository,
-                METRICS_PORT);
-        running = false;
+
+        this.processArgs = new LinkedList<>();
+        this.processArgs.addAll(RuntimeUtils.getArgsBeforeCmd(instanceConfig, extraDependenciesDir));
+        // use exec to to launch function so that it gets launched in the foreground with the same PID as shell
+        // so that when we kill the pod, the signal will get propagated to the function code
+        this.processArgs.add("exec");
+        this.processArgs.addAll(
+                RuntimeUtils.getCmd(
+                        instanceConfig,
+                        instanceFile,
+                        extraDependenciesDir,
+                        logDirectory,
+                        this.originalCodeFileName,
+                        pulsarServiceUrl,
+                        stateStorageServiceUrl,
+                        authConfig,
+                        "$" + ENV_SHARD_ID,
+                        GRPC_PORT,
+                        -1l,
+                        logConfigFile,
+                        secretsProviderClassName,
+                        secretsProviderConfig,
+                        installUserCodeDependencies,
+                        pythonDependencyRepository,
+                        pythonExtraDependencyRepository,
+                        METRICS_PORT));
+
         doChecks(instanceConfig.getFunctionDetails());
     }
 
     /**
-     * The core logic that creates a service first followed by statefulset
+     * The core logic that creates a service first followed by statefulset.
      */
     @Override
     public void start() throws Exception {
@@ -212,7 +231,6 @@ class KubernetesRuntime implements Runtime {
                     instanceConfig.getFunctionDetails().getName(), e);
             deleteService();
         }
-        running = true;
         if (channel == null && stub == null) {
             channel = new ManagedChannel[instanceConfig.getFunctionDetails().getParallelism()];
             stub = new InstanceControlGrpc.InstanceControlFutureStub[instanceConfig.getFunctionDetails().getParallelism()];
@@ -235,10 +253,9 @@ class KubernetesRuntime implements Runtime {
 
     @Override
     public void stop() throws Exception {
-        if (running) {
-            deleteStatefulSet();
-            deleteService();
-        }
+        deleteStatefulSet();
+        deleteService();
+
         if (channel != null) {
             for (ManagedChannel cn : channel) {
                 cn.shutdown();
@@ -246,7 +263,6 @@ class KubernetesRuntime implements Runtime {
         }
         channel = null;
         stub = null;
-        running = false;
     }
 
     @Override
@@ -288,14 +304,14 @@ class KubernetesRuntime implements Runtime {
     @Override
     public CompletableFuture<InstanceCommunication.MetricsData> getAndResetMetrics() {
         CompletableFuture<InstanceCommunication.MetricsData> retval = new CompletableFuture<>();
-        retval.completeExceptionally(new RuntimeException("Kubernetes Runtime doesnt support getAndReset metrics via rest"));
+        retval.completeExceptionally(new RuntimeException("Kubernetes Runtime doesn't support getAndReset metrics via rest"));
         return retval;
     }
 
     @Override
     public CompletableFuture<Void> resetMetrics() {
         CompletableFuture<Void> retval = new CompletableFuture<>();
-        retval.completeExceptionally(new RuntimeException("Kubernetes Runtime doesnt support resetting metrics via rest"));
+        retval.completeExceptionally(new RuntimeException("Kubernetes Runtime doesn't support resetting metrics via rest"));
         return retval;
     }
 
@@ -335,36 +351,52 @@ class KubernetesRuntime implements Runtime {
 
     @Override
     public boolean isAlive() {
-        return running;
+        // No point for kubernetes just return dummy value
+        return true;
     }
 
     private void submitService() throws Exception {
         final V1Service service = createService();
         log.info("Submitting the following service to k8 {}", coreClient.getApiClient().getJSON().serialize(service));
 
-        final Response response =
-                coreClient.createNamespacedServiceCall(jobNamespace, service, null,
-                        null, null).execute();
-        if (!response.isSuccessful()) {
-            if (response.code() == HTTP_CONFLICT) {
-                log.warn("Service already created for function {}/{}/{}",
-                        instanceConfig.getFunctionDetails().getTenant(),
-                        instanceConfig.getFunctionDetails().getNamespace(),
-                        instanceConfig.getFunctionDetails().getName());
-            } else {
-                log.error("Error creating Service for function {}/{}/{}:- {}",
-                        instanceConfig.getFunctionDetails().getTenant(),
-                        instanceConfig.getFunctionDetails().getNamespace(),
-                        instanceConfig.getFunctionDetails().getName(),
-                        response.message());
-                // construct a message based on the k8s api server response
-                throw new IllegalStateException(response.message());
-            }
-        } else {
-            log.info("Service Created Successfully for function {}/{}/{}",
-                    instanceConfig.getFunctionDetails().getTenant(),
-                    instanceConfig.getFunctionDetails().getNamespace(),
-                    instanceConfig.getFunctionDetails().getName());
+        String fqfn = FunctionDetailsUtils.getFullyQualifiedName(instanceConfig.getFunctionDetails());
+
+        Actions.Action createService = Actions.Action.builder()
+                .actionName(String.format("Submitting service for function %s", fqfn))
+                .numRetries(NUM_RETRIES)
+                .sleepBetweenInvocationsMs(SLEEP_BETWEEN_RETRIES_MS)
+                .supplier(() -> {
+                    final V1Service response;
+                    try {
+                        response = coreClient.createNamespacedService(jobNamespace, service, null);
+                    } catch (ApiException e) {
+                        // already exists
+                        if (e.getCode() == HTTP_CONFLICT) {
+                            log.warn("Service already present for function {}", fqfn);
+                            return Actions.ActionResult.builder().success(true).build();
+                        }
+
+                        String errorMsg = e.getResponseBody() != null ? e.getResponseBody() : e.getMessage();
+                        return Actions.ActionResult.builder()
+                                .success(false)
+                                .errorMsg(errorMsg)
+                                .build();
+                    }
+
+                    return Actions.ActionResult.builder().success(true).build();
+                })
+                .build();
+
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        Actions.newBuilder()
+                .addAction(createService.toBuilder()
+                        .onSuccess((ignored) -> success.set(true))
+                        .build())
+                .run();
+
+        if (!success.get()) {
+            throw new RuntimeException(String.format("Failed to create service for function %s", fqfn));
         }
     }
 
@@ -399,75 +431,299 @@ class KubernetesRuntime implements Runtime {
 
         log.info("Submitting the following spec to k8 {}", appsClient.getApiClient().getJSON().serialize(statefulSet));
 
-        final Response response =
-                appsClient.createNamespacedStatefulSetCall(jobNamespace, statefulSet, null,
-                        null, null).execute();
-        if (!response.isSuccessful()) {
-            if (response.code() == HTTP_CONFLICT) {
-                log.warn("Statefulset already present for function {}/{}/{}",
-                        instanceConfig.getFunctionDetails().getTenant(),
-                        instanceConfig.getFunctionDetails().getNamespace(),
-                        instanceConfig.getFunctionDetails().getName());
-            } else {
-                log.error("Error creating statefulset for function {}/{}/{}:- {}",
-                        instanceConfig.getFunctionDetails().getTenant(),
-                        instanceConfig.getFunctionDetails().getNamespace(),
-                        instanceConfig.getFunctionDetails().getName(),
-                        response.message());
-                // construct a message based on the k8s api server response
-                throw new IllegalStateException(response.message());
-            }
-        } else {
-            log.info("Successfully created statefulset for function {}/{}/{}",
-                    instanceConfig.getFunctionDetails().getTenant(),
-                    instanceConfig.getFunctionDetails().getNamespace(),
-                    instanceConfig.getFunctionDetails().getName());
+        String fqfn = FunctionDetailsUtils.getFullyQualifiedName(instanceConfig.getFunctionDetails());
+
+        Actions.Action createStatefulSet = Actions.Action.builder()
+                .actionName(String.format("Submitting statefulset for function %s", fqfn))
+                .numRetries(NUM_RETRIES)
+                .sleepBetweenInvocationsMs(SLEEP_BETWEEN_RETRIES_MS)
+                .supplier(() -> {
+                    final V1StatefulSet response;
+                    try {
+                        response = appsClient.createNamespacedStatefulSet(jobNamespace, statefulSet, null);
+                    } catch (ApiException e) {
+                        // already exists
+                        if (e.getCode() == HTTP_CONFLICT) {
+                            log.warn("Statefulset already present for function {}", fqfn);
+                            return Actions.ActionResult.builder().success(true).build();
+                        }
+
+                        String errorMsg = e.getResponseBody() != null ? e.getResponseBody() : e.getMessage();
+                        return Actions.ActionResult.builder()
+                                .success(false)
+                                .errorMsg(errorMsg)
+                                .build();
+                    }
+
+                    return Actions.ActionResult.builder().success(true).build();
+                })
+                .build();
+
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        Actions.newBuilder()
+                .addAction(createStatefulSet.toBuilder()
+                        .onSuccess((ignored) -> success.set(true))
+                        .build())
+                .run();
+
+        if (!success.get()) {
+            throw new RuntimeException(String.format("Failed to create statefulset for function %s", fqfn));
         }
     }
 
-    public void deleteStatefulSet() throws Exception {
-        final V1DeleteOptions options = new V1DeleteOptions();
-        options.setGracePeriodSeconds(0L);
-        options.setPropagationPolicy("Foreground");
-        final Response response = appsClient.deleteNamespacedStatefulSetCall(
-                createJobName(instanceConfig.getFunctionDetails()),
-                jobNamespace, options, null, null, null, null, null, null)
-                .execute();
 
-        if (!response.isSuccessful()) {
-            throw new RuntimeException(String.format("Error deleting statefulset for function {}/{}/{} :- {} ",
-                    instanceConfig.getFunctionDetails().getTenant(),
-                    instanceConfig.getFunctionDetails().getNamespace(),
-                    instanceConfig.getFunctionDetails().getName(),
-                    response.message()));
+    public void deleteStatefulSet() throws InterruptedException {
+        String statefulSetName = createJobName(instanceConfig.getFunctionDetails());
+        final V1DeleteOptions options = new V1DeleteOptions();
+        options.setGracePeriodSeconds(5L);
+        options.setPropagationPolicy("Foreground");
+
+        String fqfn = FunctionDetailsUtils.getFullyQualifiedName(instanceConfig.getFunctionDetails());
+        Actions.Action deleteStatefulSet = Actions.Action.builder()
+                .actionName(String.format("Deleting statefulset for function %s", fqfn))
+                .numRetries(NUM_RETRIES)
+                .sleepBetweenInvocationsMs(SLEEP_BETWEEN_RETRIES_MS)
+                .supplier(() -> {
+                    Response response;
+                    try {
+                        // cannot use deleteNamespacedStatefulSet because of bug in kuberenetes
+                        // https://github.com/kubernetes-client/java/issues/86
+                        response = appsClient.deleteNamespacedStatefulSetCall(
+                                statefulSetName,
+                                jobNamespace, options, null,
+                                null, null, null,
+                                null, null)
+                                .execute();
+                    } catch (ApiException e) {
+                        // if already deleted
+                        if (e.getCode() == HTTP_NOT_FOUND) {
+                            log.warn("Statefulset for function {} does not exist", fqfn);
+                            return Actions.ActionResult.builder().success(true).build();
+                        }
+
+                        String errorMsg = e.getResponseBody() != null ? e.getResponseBody() : e.getMessage();
+                        return Actions.ActionResult.builder()
+                                .success(false)
+                                .errorMsg(errorMsg)
+                                .build();
+                    } catch (IOException e) {
+                        return Actions.ActionResult.builder()
+                                .success(false)
+                                .errorMsg(e.getMessage())
+                                .build();
+                    }
+
+                    // if already deleted
+                    if (response.code() == HTTP_NOT_FOUND) {
+                        log.warn("Statefulset for function {} does not exist", fqfn);
+                        return Actions.ActionResult.builder().success(true).build();
+                    } else {
+                        return Actions.ActionResult.builder()
+                                .success(response.isSuccessful())
+                                .errorMsg(response.message())
+                                .build();
+                    }
+                })
+                .build();
+
+
+        Actions.Action waitForStatefulSetDeletion = Actions.Action.builder()
+                .actionName(String.format("Waiting for statefulset for function %s to complete deletion", fqfn))
+                // set retry period to be about 2x the graceshutdown time
+                .numRetries(NUM_RETRIES * 2)
+                .sleepBetweenInvocationsMs(SLEEP_BETWEEN_RETRIES_MS* 2)
+                .supplier(() -> {
+                    V1StatefulSet response;
+                    try {
+                        response = appsClient.readNamespacedStatefulSet(statefulSetName, jobNamespace,
+                                null, null, null);
+                    } catch (ApiException e) {
+                        // statefulset is gone
+                        if (e.getCode() == HTTP_NOT_FOUND) {
+                            return Actions.ActionResult.builder().success(true).build();
+                        }
+
+                        String errorMsg = e.getResponseBody() != null ? e.getResponseBody() : e.getMessage();
+                        return Actions.ActionResult.builder()
+                                .success(false)
+                                .errorMsg(errorMsg)
+                                .build();
+                    }
+                    return Actions.ActionResult.builder()
+                            .success(false)
+                            .errorMsg(response.getStatus().toString())
+                            .build();
+                })
+                .build();
+
+        // Need to wait for all pods to die so we can cleanup subscriptions.
+        Actions.Action waitForStatefulPodsToTerminate = Actions.Action.builder()
+                .actionName(String.format("Waiting for pods for function %s to terminate", fqfn))
+                .numRetries(NUM_RETRIES * 2)
+                .sleepBetweenInvocationsMs(SLEEP_BETWEEN_RETRIES_MS * 2)
+                .supplier(() -> {
+                    String labels = String.format("tenant=%s,namespace=%s,name=%s",
+                            instanceConfig.getFunctionDetails().getTenant(),
+                            instanceConfig.getFunctionDetails().getNamespace(),
+                            instanceConfig.getFunctionDetails().getName());
+
+                    V1PodList response;
+                    try {
+                        response = coreClient.listNamespacedPod(jobNamespace, null, null,
+                                null, null, labels,
+                                null, null, null, null);
+                    } catch (ApiException e) {
+
+                        String errorMsg = e.getResponseBody() != null ? e.getResponseBody() : e.getMessage();
+                        return Actions.ActionResult.builder()
+                                .success(false)
+                                .errorMsg(errorMsg)
+                                .build();
+                    }
+
+                    if (response.getItems().size() > 0) {
+                        return Actions.ActionResult.builder()
+                                .success(false)
+                                .errorMsg(response.getItems().size() + " pods still alive.")
+                                .build();
+                    } else {
+                        return Actions.ActionResult.builder()
+                                .success(true)
+                                .build();
+                    }
+                })
+                .build();
+
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        Actions.newBuilder()
+                .addAction(deleteStatefulSet.toBuilder()
+                        .continueOn(true)
+                        .build())
+                .addAction(waitForStatefulSetDeletion.toBuilder()
+                        .continueOn(false)
+                        .onSuccess((ignored) -> success.set(true))
+                        .build())
+                .addAction(deleteStatefulSet.toBuilder()
+                        .continueOn(true)
+                        .build())
+                .addAction(waitForStatefulSetDeletion.toBuilder()
+                        .onSuccess((ignored) -> success.set(true))
+                        .build())
+                .run();
+
+        if (!success.get()) {
+            throw new RuntimeException(String.format("Failed to delete statefulset for function %s", fqfn));
         } else {
-            log.info("Successfully deleted statefulset for function {}/{}/{}",
-                    instanceConfig.getFunctionDetails().getTenant(),
-                    instanceConfig.getFunctionDetails().getNamespace(),
-                    instanceConfig.getFunctionDetails().getName());
+            // wait for pods to terminate
+            Actions.newBuilder()
+                    .addAction(waitForStatefulPodsToTerminate)
+                    .run();
         }
     }
 
-    public void deleteService() throws Exception {
+    public void deleteService() throws InterruptedException {
+
         final V1DeleteOptions options = new V1DeleteOptions();
         options.setGracePeriodSeconds(0L);
         options.setPropagationPolicy("Foreground");
-        final Response response = coreClient.deleteNamespacedServiceCall(
-                createJobName(instanceConfig.getFunctionDetails()),
-                jobNamespace, options, null, null, null, null, null, null)
-                .execute();
+        String fqfn = FunctionDetailsUtils.getFullyQualifiedName(instanceConfig.getFunctionDetails());
+        String serviceName = createJobName(instanceConfig.getFunctionDetails());
 
-        if (!response.isSuccessful()) {
-            throw new RuntimeException(String.format("Error deleting service for function {}/{}/{} :- {}",
-                    instanceConfig.getFunctionDetails().getTenant(),
-                    instanceConfig.getFunctionDetails().getNamespace(),
-                    instanceConfig.getFunctionDetails().getName(),
-                    response.message()));
-        } else {
-            log.info("Service deleted successfully for function {}/{}/{}",
-                    instanceConfig.getFunctionDetails().getTenant(),
-                    instanceConfig.getFunctionDetails().getNamespace(),
-                    instanceConfig.getFunctionDetails().getName());
+        Actions.Action deleteService = Actions.Action.builder()
+                .actionName(String.format("Deleting service for function %s", fqfn))
+                .numRetries(NUM_RETRIES)
+                .sleepBetweenInvocationsMs(SLEEP_BETWEEN_RETRIES_MS)
+                .supplier(() -> {
+                    final Response response;
+                    try {
+                        // cannot use deleteNamespacedService because of bug in kuberenetes
+                        // https://github.com/kubernetes-client/java/issues/86
+                        response = coreClient.deleteNamespacedServiceCall(
+                                serviceName,
+                                jobNamespace, options, null,
+                                null, null,
+                                null, null, null).execute();
+                    } catch (ApiException e) {
+                        // if already deleted
+                        if (e.getCode() == HTTP_NOT_FOUND) {
+                            log.warn("Service for function {} does not exist", fqfn);
+                            return Actions.ActionResult.builder().success(true).build();
+                        }
+
+                        String errorMsg = e.getResponseBody() != null ? e.getResponseBody() : e.getMessage();
+                        return Actions.ActionResult.builder()
+                                .success(false)
+                                .errorMsg(errorMsg)
+                                .build();
+                    } catch (IOException e) {
+                        return Actions.ActionResult.builder()
+                                .success(false)
+                                .errorMsg(e.getMessage())
+                                .build();
+                    }
+
+                    // if already deleted
+                    if (response.code() == HTTP_NOT_FOUND) {
+                        log.warn("Service for function {} does not exist", fqfn);
+                        return Actions.ActionResult.builder().success(true).build();
+                    } else {
+                        return Actions.ActionResult.builder()
+                                .success(response.isSuccessful())
+                                .errorMsg(response.message())
+                                .build();
+                    }
+                })
+                .build();
+
+        Actions.Action waitForServiceDeletion = Actions.Action.builder()
+                .actionName(String.format("Waiting for statefulset for function %s to complete deletion", fqfn))
+                .numRetries(NUM_RETRIES)
+                .sleepBetweenInvocationsMs(SLEEP_BETWEEN_RETRIES_MS)
+                .supplier(() -> {
+                    V1Service response;
+                    try {
+                        response = coreClient.readNamespacedService(serviceName, jobNamespace,
+                                null, null, null);
+
+                    } catch (ApiException e) {
+                        // statefulset is gone
+                        if (e.getCode() == HTTP_NOT_FOUND) {
+                            return Actions.ActionResult.builder().success(true).build();
+                        }
+                        String errorMsg = e.getResponseBody() != null ? e.getResponseBody() : e.getMessage();
+                        return Actions.ActionResult.builder()
+                                .success(false)
+                                .errorMsg(errorMsg)
+                                .build();
+                    }
+                    return Actions.ActionResult.builder()
+                            .success(false)
+                            .errorMsg(response.getStatus().toString())
+                            .build();
+                })
+                .build();
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        Actions.newBuilder()
+                .addAction(deleteService.toBuilder()
+                        .continueOn(true)
+                        .build())
+                .addAction(waitForServiceDeletion.toBuilder()
+                        .continueOn(false)
+                        .onSuccess((ignored) -> success.set(true))
+                        .build())
+                .addAction(deleteService.toBuilder()
+                        .continueOn(true)
+                        .build())
+                .addAction(waitForServiceDeletion.toBuilder()
+                        .onSuccess((ignored) -> success.set(true))
+                        .build())
+                .run();
+
+        if (!success.get()) {
+            throw new RuntimeException(String.format("Failed to delete service for function %s", fqfn));
         }
     }
 
@@ -612,7 +868,8 @@ class KubernetesRuntime implements Runtime {
         return tolerations;
     }
 
-    private V1Container getFunctionContainer(List<String> instanceCommand, Function.Resources resource) {
+    @VisibleForTesting
+    V1Container getFunctionContainer(List<String> instanceCommand, Function.Resources resource) {
         final V1Container container = new V1Container().name(PULSARFUNCTIONS_CONTAINER_NAME);
 
         // set up the container images
@@ -633,7 +890,14 @@ class KubernetesRuntime implements Runtime {
         // set container resources
         final V1ResourceRequirements resourceRequirements = new V1ResourceRequirements();
         final Map<String, Quantity> requests = new HashMap<>();
-        requests.put("memory", Quantity.fromString(Long.toString(resource != null && resource.getRam() != 0 ? resource.getRam() : 1073741824)));
+
+        long ram = resource != null && resource.getRam() != 0 ? resource.getRam() : 1073741824;
+
+        // add memory padding
+        long padding = Math.round(ram * (percentMemoryPadding / 100.0));
+        long ramWithPadding = ram + padding;
+
+        requests.put("memory", Quantity.fromString(Long.toString(ramWithPadding)));
         requests.put("cpu", Quantity.fromString(Double.toString(resource != null && resource.getCpu() != 0 ? resource.getCpu() : 1)));
         resourceRequirements.setRequests(requests);
         resourceRequirements.setLimits(requests);

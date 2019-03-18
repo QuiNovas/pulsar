@@ -27,6 +27,7 @@
 #include <pulsar/Schema.h>
 #include <pulsar/ConsumerCryptoFailureAction.h>
 #include <pulsar/CryptoKeyReader.h>
+#include <pulsar/InitialPosition.h>
 
 #pragma GCC visibility push(default)
 namespace pulsar {
@@ -149,6 +150,27 @@ class ConsumerConfiguration {
     long getUnAckedMessagesTimeoutMs() const;
 
     /**
+     * Set the delay to wait before re-delivering messages that have failed to be process.
+     * <p>
+     * When application uses {@link Consumer#negativeAcknowledge(Message)}, the failed message
+     * will be redelivered after a fixed timeout. The default is 1 min.
+     *
+     * @param redeliveryDelay
+     *            redelivery delay for failed messages
+     * @param timeUnit
+     *            unit in which the timeout is provided.
+     * @return the consumer builder instance
+     */
+    void setNegativeAckRedeliveryDelayMs(long redeliveryDelayMillis);
+
+    /**
+     * Get the configured delay to wait before re-delivering messages that have failed to be process.
+     *
+     * @return redelivery delay for failed messages
+     */
+    long getNegativeAckRedeliveryDelayMs() const;
+
+    /**
      * Set the time duration for which the broker side consumer stats will be cached in the client.
      * @param cacheTimeInMs in milliseconds
      */
@@ -178,6 +200,9 @@ class ConsumerConfiguration {
      */
     void setPatternAutoDiscoveryPeriod(int periodInSeconds);
     int getPatternAutoDiscoveryPeriod() const;
+
+    void setSubscriptionInitialPosition(InitialPosition subscriptionInitialPosition);
+    InitialPosition getSubscriptionInitialPosition() const;
 
     /**
      * Check whether the message has a specific property attached.

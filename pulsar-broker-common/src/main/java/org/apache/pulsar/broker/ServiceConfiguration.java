@@ -20,6 +20,9 @@ package org.apache.pulsar.broker;
 
 
 import com.google.common.collect.Sets;
+
+import io.netty.util.internal.PlatformDependent;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -34,7 +37,6 @@ import org.apache.pulsar.common.configuration.Category;
 import org.apache.pulsar.common.configuration.FieldContext;
 import org.apache.pulsar.common.configuration.PulsarConfiguration;
 import org.apache.pulsar.common.policies.data.BacklogQuota;
-import org.apache.pulsar.common.stats.JvmG1GCMetricsLogger;
 
 /**
  * Pulsar service configuration object.
@@ -144,7 +146,10 @@ public class ServiceConfiguration implements PulsarConfiguration {
             doc = "Number of threads to use for HTTP requests processing"
                 + " Default is set to `2 * Runtime.getRuntime().availableProcessors()`"
         )
-    private int numHttpServerThreads = 2 * Runtime.getRuntime().availableProcessors();
+    // Use at least 8 threads to avoid having Jetty go into threads starving and
+    // having the possibility of getting into a deadlock where a Jetty thread is
+    // waiting for another HTTP call to complete in same thread.
+    private int numHttpServerThreads = Math.max(8, 2 * Runtime.getRuntime().availableProcessors());
 
     @FieldContext(
         category = CATEGORY_WEBSOCKET,
@@ -234,6 +239,13 @@ public class ServiceConfiguration implements PulsarConfiguration {
             + " When it is 0, inactive subscriptions are not deleted automatically"
     )
     private long subscriptionExpirationTimeMinutes = 0;
+    @FieldContext(
+            category = CATEGORY_POLICIES,
+            dynamic = true,
+            doc = "Enable subscription message redelivery tracker to send redelivery "
+                    + "count to consumer (default is enabled)"
+        )
+    private boolean subscriptionRedeliveryTrackerEnabled = true;
     @FieldContext(
         category = CATEGORY_POLICIES,
         doc = "How frequently to proactively check and purge expired subscription"
@@ -365,6 +377,31 @@ public class ServiceConfiguration implements PulsarConfiguration {
             + " published messages and don't have backlog. This enables dispatch-throttling for "
             + " non-backlog consumers as well.")
     private boolean dispatchThrottlingOnNonBacklogConsumerEnabled = false;
+
+    // <-- dispatcher read settings -->
+    @FieldContext(
+        dynamic = true,
+        category = CATEGORY_SERVER,
+        doc = "Max number of entries to read from bookkeeper. By default it is 100 entries."
+    )
+    private int dispatcherMaxReadBatchSize = 100;
+
+    @FieldContext(
+        dynamic = true,
+        category = CATEGORY_SERVER,
+        doc = "Min number of entries to read from bookkeeper. By default it is 1 entries."
+            + "When there is an error occurred on reading entries from bookkeeper, the broker"
+            + " will backoff the batch size to this minimum number."
+    )
+    private int dispatcherMinReadBatchSize = 1;
+
+    @FieldContext(
+        dynamic = true,
+        category = CATEGORY_SERVER,
+        doc = "Max number of entries to dispatch for a shared subscription. By default it is 20 entries."
+    )
+    private int dispatcherMaxRoundRobinBatchSize = 20;
+
     @FieldContext(
         dynamic = true,
         category = CATEGORY_SERVER,
@@ -438,6 +475,11 @@ public class ServiceConfiguration implements PulsarConfiguration {
     )
     @Deprecated
     private boolean tlsEnabled = false;
+    @FieldContext(
+        category = CATEGORY_TLS,
+        doc = "Tls cert refresh duration in seconds (set 0 to check on every new connection)"
+    )
+    private long tlsCertRefreshCheckDurationSec = 300;
     @FieldContext(
         category = CATEGORY_TLS,
         doc = "Path for the TLS certificate file"
@@ -621,6 +663,11 @@ public class ServiceConfiguration implements PulsarConfiguration {
         doc = "Enable bookie isolation by specifying a list of bookie groups to choose from. \n\n"
             + "Any bookie outside the specified groups will not be used by the broker")
     private String bookkeeperClientIsolationGroups;
+    @FieldContext(category = CATEGORY_STORAGE_BK, doc = "Enable/disable having read operations for a ledger to be sticky to "
+            + "a single bookie.\n" +
+            "If this flag is enabled, the client will use one single bookie (by " +
+            "preference) to read all entries for a ledger.")
+    private boolean bookkeeperEnableStickyReads = true;
 
     /**** --- Managed Ledger --- ****/
     @FieldContext(
@@ -673,8 +720,9 @@ public class ServiceConfiguration implements PulsarConfiguration {
         category = CATEGORY_STORAGE_ML,
         doc = "Amount of memory to use for caching data payload in managed ledger. \n\nThis"
             + " memory is allocated from JVM direct memory and it's shared across all the topics"
-            + " running in the same broker")
-    private int managedLedgerCacheSizeMB = 1024;
+            + " running in the same broker. By default, uses 1/5th of available direct memory")
+    private int managedLedgerCacheSizeMB = Math.max(64,
+            (int) (PlatformDependent.maxDirectMemory() / 5 / (1024 * 1024)));
     @FieldContext(
         category = CATEGORY_STORAGE_ML,
         doc = "Threshold to which bring down the cache level when eviction is triggered"
@@ -685,7 +733,11 @@ public class ServiceConfiguration implements PulsarConfiguration {
         doc = "Rate limit the amount of writes per second generated by consumer acking the messages"
     )
     private double managedLedgerDefaultMarkDeleteRateLimit = 1.0;
-
+    @FieldContext(
+        category = CATEGORY_STORAGE_ML,
+    	doc = "Allow automated creation of non-partition topics if set to true (default value)."
+    )
+    private boolean allowAutoTopicCreation = true;
     @FieldContext(
         category = CATEGORY_STORAGE_ML,
         doc = "Number of threads to be used for managed ledger tasks dispatching"
@@ -765,8 +817,8 @@ public class ServiceConfiguration implements PulsarConfiguration {
                     + "(0 to disable it)"
         )
     private long managedLedgerReadEntryTimeoutSeconds = 120;
-        
-    @FieldContext(category = CATEGORY_STORAGE_ML, 
+
+    @FieldContext(category = CATEGORY_STORAGE_ML,
             doc = "Add entry timeout when broker tries to publish message to bookkeeper.(0 to disable it)")
     private long managedLedgerAddEntryTimeoutSeconds = 120;
 
@@ -1029,7 +1081,7 @@ public class ServiceConfiguration implements PulsarConfiguration {
     )
     private boolean exposeConsumerLevelMetricsInPrometheus = false;
     @FieldContext(
-            category = CATEGORY_METRICS, 
+            category = CATEGORY_METRICS,
             doc = "Classname of Pluggable JVM GC metrics logger that can log GC specific metrics")
     private String jvmGCMetricsLoggerClassName;
 

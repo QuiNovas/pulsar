@@ -18,6 +18,8 @@
  */
 #pragma once
 
+#include "consumer.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -43,6 +45,17 @@ typedef enum {
      */
     pulsar_ConsumerFailover
 } pulsar_consumer_type;
+
+typedef enum {
+    /**
+     * the latest position which means the start consuming position will be the last message
+     */
+    initial_position_latest,
+    /**
+     * the earliest position which means the start consuming position will be the first message
+     */
+    initial_position_earliest
+} initial_position;
 
 /// Callback definition for MessageListener
 typedef void (*pulsar_message_listener)(pulsar_consumer_t *consumer, pulsar_message_t *msg, void *ctx);
@@ -145,12 +158,42 @@ void pulsar_consumer_set_unacked_messages_timeout_ms(pulsar_consumer_configurati
  */
 long pulsar_consumer_get_unacked_messages_timeout_ms(pulsar_consumer_configuration_t *consumer_configuration);
 
+/**
+ * Set the delay to wait before re-delivering messages that have failed to be process.
+ * <p>
+ * When application uses {@link Consumer#negativeAcknowledge(Message)}, the failed message
+ * will be redelivered after a fixed timeout. The default is 1 min.
+ *
+ * @param redeliveryDelay
+ *            redelivery delay for failed messages
+ * @param timeUnit
+ *            unit in which the timeout is provided.
+ * @return the consumer builder instance
+ */
+void pulsar_configure_set_negative_ack_redelivery_delay_ms(
+    pulsar_consumer_configuration_t *consumer_configuration, long redeliveryDelayMillis);
+
+/**
+ * Get the configured delay to wait before re-delivering messages that have failed to be process.
+ *
+ * @param consumer_configuration the consumer conf object
+ * @return redelivery delay for failed messages
+ */
+long pulsar_configure_get_negative_ack_redelivery_delay_ms(
+    pulsar_consumer_configuration_t *consumer_configuration);
+
 int pulsar_consumer_is_encryption_enabled(pulsar_consumer_configuration_t *consumer_configuration);
 
 int pulsar_consumer_is_read_compacted(pulsar_consumer_configuration_t *consumer_configuration);
 
 void pulsar_consumer_set_read_compacted(pulsar_consumer_configuration_t *consumer_configuration,
                                         int compacted);
+
+int pulsar_consumer_get_subscription_initial_position(
+    pulsar_consumer_configuration_t *consumer_configuration);
+
+void pulsar_consumer_set_subscription_initial_position(
+    pulsar_consumer_configuration_t *consumer_configuration, initial_position subscriptionInitialPosition);
 
 void pulsar_consumer_configuration_set_property(pulsar_consumer_configuration_t *conf, const char *name,
                                                 const char *value);

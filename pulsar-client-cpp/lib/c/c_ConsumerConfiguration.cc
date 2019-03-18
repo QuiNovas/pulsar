@@ -101,6 +101,15 @@ long pulsar_consumer_get_unacked_messages_timeout_ms(
     return consumer_configuration->consumerConfiguration.getUnAckedMessagesTimeoutMs();
 }
 
+void pulsar_configure_set_negative_ack_redelivery_delay_ms(
+    pulsar_consumer_configuration_t *consumer_configuration, long redeliveryDelayMillis) {
+    consumer_configuration->consumerConfiguration.setNegativeAckRedeliveryDelayMs(redeliveryDelayMillis);
+}
+long pulsar_configure_get_negative_ack_redelivery_delay_ms(
+    pulsar_consumer_configuration_t *consumer_configuration) {
+    return consumer_configuration->consumerConfiguration.getNegativeAckRedeliveryDelayMs();
+}
+
 int pulsar_consumer_is_encryption_enabled(pulsar_consumer_configuration_t *consumer_configuration) {
     return consumer_configuration->consumerConfiguration.isEncryptionEnabled();
 }
@@ -117,4 +126,15 @@ void pulsar_consumer_set_read_compacted(pulsar_consumer_configuration_t *consume
 void pulsar_consumer_configuration_set_property(pulsar_consumer_configuration_t *conf, const char *name,
                                                 const char *value) {
     conf->consumerConfiguration.setProperty(name, value);
+}
+
+void pulsar_consumer_set_subscription_initial_position(
+    pulsar_consumer_configuration_t *consumer_configuration, initial_position subscriptionInitialPosition) {
+    consumer_configuration->consumerConfiguration.setSubscriptionInitialPosition(
+        (pulsar::InitialPosition)subscriptionInitialPosition);
+}
+
+int pulsar_consumer_get_subscription_initial_position(
+    pulsar_consumer_configuration_t *consumer_configuration) {
+    return consumer_configuration->consumerConfiguration.getSubscriptionInitialPosition();
 }

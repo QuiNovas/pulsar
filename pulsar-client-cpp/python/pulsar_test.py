@@ -140,6 +140,31 @@ class PulsarTest(TestCase):
         consumer.unsubscribe()
         client.close()
 
+    def test_message_properties(self):
+        client = Client(self.serviceUrl)
+        topic = 'my-python-test-message-properties'
+        consumer = client.subscribe(topic=topic,
+                                    subscription_name='my-subscription',
+                                    schema=pulsar.schema.StringSchema())
+        producer = client.create_producer(topic=topic,
+                                          schema=StringSchema())
+        producer.send('hello',
+                      properties={
+                          'a': '1',
+                          'b': '2'
+                      })
+
+        msg = consumer.receive()
+        self.assertTrue(msg)
+        self.assertEqual(msg.value(), 'hello')
+        self.assertEqual(msg.properties(), {
+                          'a': '1',
+                          'b': '2'
+                      })
+
+        consumer.unsubscribe()
+        client.close()
+
     def test_tls_auth(self):
         certs_dir = '/pulsar/pulsar-broker/src/test/resources/authentication/tls/'
         if not os.path.exists(certs_dir):
@@ -889,6 +914,36 @@ class PulsarTest(TestCase):
 
         msg = consumer.receive(1000)
         self.assertTrue(msg.topic_name() in partitions)
+        client.close()
+
+    def test_negative_acks(self):
+        client = Client(self.serviceUrl)
+        consumer = client.subscribe('test_negative_acks',
+                                    'test',
+                                    schema=pulsar.schema.StringSchema())
+        producer = client.create_producer('test_negative_acks',
+                                          schema=pulsar.schema.StringSchema())
+        for i in range(10):
+            producer.send_async('hello-%d' % i, callback=None)
+
+        producer.flush()
+
+        for i in range(10):
+            msg = consumer.receive()
+            self.assertEqual(msg.value(), "hello-%d" % i)
+            consumer.negative_acknowledge(msg)
+
+        for i in range(10):
+            msg = consumer.receive()
+            self.assertEqual(msg.value(), "hello-%d" % i)
+            consumer.acknowledge(msg)
+
+        try:
+            # No more messages expected
+            msg = consumer.receive(100)
+            self.assertTrue(False)
+        except:
+            pass  # Exception is expected
         client.close()
 
     def _check_value_error(self, fun):

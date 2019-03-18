@@ -130,6 +130,8 @@ public class ManagedCursorImpl implements ManagedCursor {
 
     private RateLimiter markDeleteLimiter;
 
+    private boolean alwaysInactive = false;
+
     class MarkDeleteEntry {
         final PositionImpl newPosition;
         final MarkDeleteCallback callback;
@@ -166,6 +168,7 @@ public class ManagedCursorImpl implements ManagedCursor {
         NoLedger, // There is no metadata ledger open for writing
         Open, // Metadata ledger is ready
         SwitchingLedger, // The metadata ledger is being switched
+        Closing, // The managed cursor is closing
         Closed // The managed cursor has been closed
     }
 
@@ -439,7 +442,7 @@ public class ManagedCursorImpl implements ManagedCursor {
     public void asyncReadEntries(final int numberOfEntriesToRead, final ReadEntriesCallback callback,
             final Object ctx) {
         checkArgument(numberOfEntriesToRead > 0);
-        if (STATE_UPDATER.get(this) == State.Closed) {
+        if (isClosed()) {
             callback.readEntriesFailed(new ManagedLedgerException("Cursor was already closed"), ctx);
             return;
         }
@@ -489,7 +492,7 @@ public class ManagedCursorImpl implements ManagedCursor {
     public void asyncGetNthEntry(int n, IndividualDeletedEntries deletedEntries, ReadEntryCallback callback,
             Object ctx) {
         checkArgument(n > 0);
-        if (STATE_UPDATER.get(this) == State.Closed) {
+        if (isClosed()) {
             callback.readEntryFailed(new ManagedLedgerException("Cursor was already closed"), ctx);
             return;
         }
@@ -554,7 +557,7 @@ public class ManagedCursorImpl implements ManagedCursor {
     @Override
     public void asyncReadEntriesOrWait(int numberOfEntriesToRead, ReadEntriesCallback callback, Object ctx) {
         checkArgument(numberOfEntriesToRead > 0);
-        if (STATE_UPDATER.get(this) == State.Closed) {
+        if (isClosed()) {
             callback.readEntriesFailed(new CursorAlreadyClosedException("Cursor was already closed"), ctx);
             return;
         }
@@ -626,6 +629,10 @@ public class ManagedCursorImpl implements ManagedCursor {
                 }
             }), 10, TimeUnit.MILLISECONDS);
         }
+    }
+
+    private boolean isClosed() {
+        return state == State.Closed || state == State.Closing;
     }
 
     @Override
@@ -778,7 +785,9 @@ public class ManagedCursorImpl implements ManagedCursor {
 
     @Override
     public void setActive() {
-        ledger.activateCursor(this);
+        if (!alwaysInactive) {
+            ledger.activateCursor(this);
+        }
     }
 
     @Override
@@ -789,6 +798,12 @@ public class ManagedCursorImpl implements ManagedCursor {
     @Override
     public void setInactive() {
         ledger.deactivateCursor(this);
+    }
+
+    @Override
+    public void setAlwaysInactive() {
+        setInactive();
+        this.alwaysInactive = true;
     }
 
     @Override
@@ -1351,7 +1366,7 @@ public class ManagedCursorImpl implements ManagedCursor {
         checkNotNull(position);
         checkArgument(position instanceof PositionImpl);
 
-        if (STATE_UPDATER.get(this) == State.Closed) {
+        if (isClosed()) {
             callback.markDeleteFailed(new ManagedLedgerException("Cursor was already closed"), ctx);
             return;
         }
@@ -1567,7 +1582,7 @@ public class ManagedCursorImpl implements ManagedCursor {
 
     @Override
     public void asyncDelete(Iterable<Position> positions, AsyncCallbacks.DeleteCallback callback, Object ctx) {
-        if (state == State.Closed) {
+        if (isClosed()) {
             callback.deleteFailed(new ManagedLedgerException("Cursor was already closed"), ctx);
             return;
         }
@@ -1652,13 +1667,17 @@ public class ManagedCursorImpl implements ManagedCursor {
 
         // Apply rate limiting to mark-delete operations
         if (markDeleteLimiter != null && !markDeleteLimiter.tryAcquire()) {
-            lastMarkDeleteEntry = new MarkDeleteEntry(newMarkDeletePosition, Collections.emptyMap(), null, null);
+            lastMarkDeleteEntry = new MarkDeleteEntry(newMarkDeletePosition, lastMarkDeleteEntry.properties, null,
+                    null);
             callback.deleteComplete(ctx);
             return;
         }
 
         try {
-            internalAsyncMarkDelete(newMarkDeletePosition, Collections.emptyMap(), new MarkDeleteCallback() {
+            Map<String, Long> properties = lastMarkDeleteEntry != null ? lastMarkDeleteEntry.properties
+                    : Collections.emptyMap();
+
+            internalAsyncMarkDelete(newMarkDeletePosition, properties, new MarkDeleteCallback() {
                 @Override
                 public void markDeleteComplete(Object ctx) {
                     callback.deleteComplete(ctx);
@@ -1885,6 +1904,14 @@ public class ManagedCursorImpl implements ManagedCursor {
 
     private void persistPositionMetaStore(long cursorsLedgerId, PositionImpl position, Map<String, Long> properties,
             MetaStoreCallback<Void> callback, boolean persistIndividualDeletedMessageRanges) {
+        if (state == State.Closed) {
+            ledger.getExecutor().execute(safeRun(() -> {
+                callback.operationFailed(new MetaStoreException(
+                        new ManagedLedgerException.CursorAlreadyClosedException(name + " cursor already closed")));
+            }));
+            return;
+        }
+
         // When closing we store the last mark-delete position in the z-node itself, so we won't need the cursor ledger,
         // hence we write it as -1. The cursor ledger is deleted once the z-node write is confirmed.
         ManagedCursorInfo.Builder info = ManagedCursorInfo.newBuilder() //
@@ -1919,13 +1946,14 @@ public class ManagedCursorImpl implements ManagedCursor {
 
     @Override
     public void asyncClose(final AsyncCallbacks.CloseCallback callback, final Object ctx) {
-        State oldState = STATE_UPDATER.getAndSet(this, State.Closed);
-        if (oldState == State.Closed) {
+        State oldState = STATE_UPDATER.getAndSet(this, State.Closing);
+        if (oldState == State.Closed || oldState == State.Closing) {
             log.info("[{}] [{}] State is already closed", ledger.getName(), name);
             callback.closeComplete(ctx);
             return;
         }
         persistPosition(-1, lastMarkDeleteEntry.newPosition, lastMarkDeleteEntry.properties, callback, ctx);
+        STATE_UPDATER.set(this, State.Closed);
     }
 
     /**
@@ -2001,7 +2029,6 @@ public class ManagedCursorImpl implements ManagedCursor {
 
     void createNewMetadataLedger(final VoidCallback callback) {
         ledger.mbean.startCursorLedgerCreateOp();
-
         ledger.asyncCreateLedger(bookkeeper, config, digestType, (rc, lh, ctx) -> {
 
             if (ledger.checkAndCompleteLedgerOpTask(rc, lh, ctx)) {
@@ -2067,7 +2094,7 @@ public class ManagedCursorImpl implements ManagedCursor {
                     }
                 });
             }));
-        }, Collections.emptyMap());
+        }, LedgerMetadataUtils.buildAdditionalMetadataForCursor(name));
 
     }
 
@@ -2175,7 +2202,7 @@ public class ManagedCursorImpl implements ManagedCursor {
         long now = clock.millis();
         if ((lh.getLastAddConfirmed() >= config.getMetadataMaxEntriesPerLedger()
                 || lastLedgerSwitchTimestamp < (now - config.getLedgerRolloverTimeout() * 1000))
-                && STATE_UPDATER.get(this) != State.Closed) {
+                && (STATE_UPDATER.get(this) != State.Closed && STATE_UPDATER.get(this) != State.Closing)) {
             // It's safe to modify the timestamp since this method will be only called from a callback, implying that
             // calls will be serialized on one single thread
             lastLedgerSwitchTimestamp = now;

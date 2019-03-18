@@ -56,7 +56,6 @@ import org.apache.pulsar.functions.api.Function;
 import org.apache.pulsar.functions.api.Record;
 import org.apache.pulsar.functions.instance.state.StateContextImpl;
 import org.apache.pulsar.functions.instance.stats.ComponentStatsManager;
-import org.apache.pulsar.functions.instance.stats.FunctionStatsManager;
 import org.apache.pulsar.functions.proto.Function.SinkSpec;
 import org.apache.pulsar.functions.proto.Function.SourceSpec;
 import org.apache.pulsar.functions.proto.InstanceCommunication;
@@ -215,11 +214,11 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
         Logger instanceLog = LoggerFactory.getLogger(
                 "function-" + instanceConfig.getFunctionDetails().getName());
         return new ContextImpl(instanceConfig, instanceLog, client, inputTopics, secretsProvider,
-                collectorRegistry, metricsLabels, this.componentType);
+                collectorRegistry, metricsLabels, this.componentType, this.stats);
     }
 
     /**
-     * The core logic that initialize the instance thread and executes the function
+     * The core logic that initialize the instance thread and executes the function.
      */
     @Override
     public void run() {
@@ -617,6 +616,9 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
                 } else if (conf.getSerdeClassName() != null && !conf.getSerdeClassName().isEmpty()) {
                     consumerConfig.setSerdeClassName(conf.getSerdeClassName());
                 }
+                if (conf.hasReceiverQueueSize()) {
+                    consumerConfig.setReceiverQueueSize(conf.getReceiverQueueSize().getValue());
+                }
                 pulsarSourceConfig.getTopicSchema().put(topic, consumerConfig);
             });
 
@@ -704,7 +706,7 @@ public class JavaInstanceRunnable implements AutoCloseable, Runnable {
 
                 pulsarSinkConfig.setTypeClassName(sinkSpec.getTypeClassName());
 
-                object = new PulsarSink(this.client, pulsarSinkConfig, this.properties);
+                object = new PulsarSink(this.client, pulsarSinkConfig, this.properties, this.stats);
             }
         } else {
             object = Reflections.createInstance(

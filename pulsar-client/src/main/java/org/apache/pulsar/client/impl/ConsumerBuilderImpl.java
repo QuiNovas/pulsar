@@ -46,7 +46,6 @@ import org.apache.pulsar.client.api.SubscriptionInitialPosition;
 import org.apache.pulsar.client.api.SubscriptionType;
 import org.apache.pulsar.client.impl.conf.ConfigurationDataUtils;
 import org.apache.pulsar.client.impl.conf.ConsumerConfigurationData;
-import org.apache.pulsar.common.api.proto.PulsarApi.CommandGetTopicsOfNamespace.Mode;
 import org.apache.pulsar.common.util.FutureUtil;
 
 import com.google.common.collect.Lists;
@@ -160,9 +159,15 @@ public class ConsumerBuilderImpl<T> implements ConsumerBuilder<T> {
 
     @Override
     public ConsumerBuilder<T> ackTimeout(long ackTimeout, TimeUnit timeUnit) {
-        checkArgument(timeUnit.toMillis(ackTimeout) >= MIN_ACK_TIMEOUT_MILLIS,
+        checkArgument(ackTimeout == 0 || timeUnit.toMillis(ackTimeout) >= MIN_ACK_TIMEOUT_MILLIS,
                 "Ack timeout should be should be greater than " + MIN_ACK_TIMEOUT_MILLIS + " ms");
         conf.setAckTimeoutMillis(timeUnit.toMillis(ackTimeout));
+        return this;
+    }
+
+    @Override
+    public ConsumerBuilder<T> negativeAckRedeliveryDelay(long redeliveryDelay, TimeUnit timeUnit) {
+        conf.setNegativeAckRedeliveryDelayMicros(timeUnit.toMicros(redeliveryDelay));
         return this;
     }
 
@@ -290,6 +295,12 @@ public class ConsumerBuilderImpl<T> implements ConsumerBuilder<T> {
             }
             conf.setDeadLetterPolicy(deadLetterPolicy);
         }
+        return this;
+    }
+
+    @Override
+    public ConsumerBuilder<T> autoUpdatePartitions(boolean autoUpdate) {
+        conf.setAutoUpdatePartitions(autoUpdate);
         return this;
     }
 

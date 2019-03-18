@@ -116,7 +116,7 @@ APIs:
 
 | Producer Method                                                               | Supported | Notes                                                                    |
 |:------------------------------------------------------------------------------|:----------|:-------------------------------------------------------------------------|
-| `Future<RecordMetadata> send(ProducerRecord<K, V> record)`                    | Yes       | Currently no support for explicitly set the partition id when publishing |
+| `Future<RecordMetadata> send(ProducerRecord<K, V> record)`                    | Yes       |                                                                          |
 | `Future<RecordMetadata> send(ProducerRecord<K, V> record, Callback callback)` | Yes       |                                                                          |
 | `void flush()`                                                                | Yes       |                                                                          |
 | `List<PartitionInfo> partitionsFor(String topic)`                             | No        |                                                                          |
@@ -129,14 +129,14 @@ Properties:
 | Config property                         | Supported | Notes                                                                         |
 |:----------------------------------------|:----------|:------------------------------------------------------------------------------|
 | `acks`                                  | Ignored   | Durability and quorum writes are configured at the namespace level            |
-| `auto.offset.reset`			  | Yes       | Will have a default value of 'latest' if user does not give specific setting. |
+| `auto.offset.reset`                     | Yes       | Will have a default value of `latest` if user does not give specific setting. |
 | `batch.size`                            | Ignored   |                                                                               |
 | `block.on.buffer.full`                  | Yes       | If true it will block producer, otherwise give error                          |
 | `bootstrap.servers`                     | Yes       | Needs to point to a single Pulsar service URL                                 |
 | `buffer.memory`                         | Ignored   |                                                                               |
 | `client.id`                             | Ignored   |                                                                               |
 | `compression.type`                      | Yes       | Allows `gzip` and `lz4`. No `snappy`.                                         |
-| `connections.max.idle.ms`               | Ignored   |                                                                               |
+| `connections.max.idle.ms`               | Yes       | Only support up to 2,147,483,647,000(Integer.MAX_VALUE * 1000) ms of idle time|
 | `interceptor.classes`                   | Ignored   |                                                                               |
 | `key.serializer`                        | Yes       |                                                                               |
 | `linger.ms`                             | Yes       | Controls the group commit time when batching messages                         |
@@ -146,13 +146,13 @@ Properties:
 | `metric.reporters`                      | Ignored   |                                                                               |
 | `metrics.num.samples`                   | Ignored   |                                                                               |
 | `metrics.sample.window.ms`              | Ignored   |                                                                               |
-| `partitioner.class`                     | Ignored   |                                                                               |
+| `partitioner.class`                     | Yes       |                                                                               |
 | `receive.buffer.bytes`                  | Ignored   |                                                                               |
 | `reconnect.backoff.ms`                  | Ignored   |                                                                               |
 | `request.timeout.ms`                    | Ignored   |                                                                               |
 | `retries`                               | Ignored   | Pulsar client retries with exponential backoff until the send timeout expires |
 | `send.buffer.bytes`                     | Ignored   |                                                                               |
-| `timeout.ms`                            | Ignored   |                                                                               |
+| `timeout.ms`                            | Yes       |                                                                               |
 | `value.serializer`                      | Yes       |                                                                               |
 
 
@@ -261,4 +261,3 @@ You can configure Pulsar authentication provider directly from the Kafka propert
 | [`pulsar.consumer.acknowledgments.group.time.millis`](http://pulsar.apache.org/api/client/org/apache/pulsar/client/api/ConsumerBuilder.html#acknowledgmentGroupTime-long-java.util.concurrent.TimeUnit-) | 100 | Set the max amount of group time for consumers to send out the acknowledgments to the broker |
 | [`pulsar.consumer.total.receiver.queue.size.across.partitions`](http://pulsar.apache.org/api/client/org/apache/pulsar/client/api/ConsumerConfiguration.html#setMaxTotalReceiverQueueSizeAcrossPartitions-int-) | 50000 | Set the max total receiver queue size across partitions |
 | [`pulsar.consumer.subscription.topics.mode`](http://pulsar.apache.org/api/client/org/apache/pulsar/client/api/ConsumerBuilder.html#subscriptionTopicsMode-Mode-) | PersistentOnly | Set the subscription topic mode for consumers |
-
